@@ -49,6 +49,7 @@ static NSLock *gLock;
 static BOOL gScanEnabled = YES;
 static BOOL gDumpEnabled = NO;
 static BOOL gHookVersion = YES;
+static BOOL gSuppressPopup = YES;
 static int gCryptoLogBudget = 600;
 static NSMutableSet *gSeenDNS;
 
@@ -82,6 +83,7 @@ static void GBLoadConfig(void) {
     if (cfg[@"scan_key"]) gScanEnabled = [cfg[@"scan_key"] boolValue];
     if (cfg[@"dump_segments"]) gDumpEnabled = [cfg[@"dump_segments"] boolValue];
     if (cfg[@"hook_checkversion"]) gHookVersion = [cfg[@"hook_checkversion"] boolValue];
+    if (cfg[@"suppress_update_popup"]) gSuppressPopup = [cfg[@"suppress_update_popup"] boolValue];
     inet_pton(AF_INET, "61.43.46.177", &gDeadIP);
 }
 
@@ -239,12 +241,30 @@ static void *GBVtableThread(void *arg) {
             size_t pg = (size_t)getpagesize();
             kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)(slotAddr & ~(pg - 1)), pg, FALSE, VM_PROT_READ | VM_PROT_WRITE);
             *(volatile uintptr_t *)slotAddr = (uintptr_t)&GBCheckVersionDone;
-            GBLog(@"[patch] vtable slot 0x%lx swapped (vm_protect=%d)", (unsigned long)slotAddr, (int)kr);
+            GBLog(@"[patch] vtable slot 0x%lx swapped (vm_protect=%d, readback ok=%d)", (unsigned long)slotAddr, (int)kr,
+                  (int)(*(volatile uintptr_t *)slotAddr == (uintptr_t)&GBCheckVersionDone));
+            // State monitor: logs every change of the game's state variable (safe now: __S3E_DATA is unpacked).
+            int last = -999; BOOL flagLogged = NO;
+            for (;;) {
+                usleep(50000);
+                uintptr_t *slot = (uintptr_t *)(0x100d7b4f8 + gSlide);
+                uintptr_t *var = slot ? (uintptr_t *)*slot : NULL;
+                char *obj = var ? (char *)*var : NULL;
+                if (!obj) continue;
+                // The lobby response code shows the "download the latest version" popup (state 2) whenever a reply
+                // is flagged as an error, unless this "popup already shown" byte (game object + 0x19951) is set.
+                if (gSuppressPopup) {
+                    volatile uint8_t *shown = (volatile uint8_t *)(obj + 0x19000 + 0x951);
+                    if (*shown == 0) { *shown = 1; if (!flagLogged) { GBLog(@"[patch] update-popup guard byte set (obj=%p)", obj); flagLogged = YES; } }
+                }
+                int st = *(int *)(obj + 0x1b000 + 0x5a0);
+                if (st != last) { GBLog(@"[state] game state %d -> %d", last, st); last = st; }
+            }
             return NULL;
         }
         usleep(50000);
     }
-    GBLog(@"[patch] vtable slot never held the expected callback (0x%lx) - NOT patched", (unsigned long)orig);
+    GBLog(@"[patch] vtable slot never held the expected callback (expected 0x%lx, found 0x%lx) - NOT patched", (unsigned long)orig, (unsigned long)*(volatile uintptr_t *)slotAddr);
     return NULL;
 }
 
@@ -447,6 +467,6 @@ __attribute__((constructor)) static void GBInit(void) {
         Class cfg = objc_getClass("__NSCFURLSessionConfiguration") ?: [NSURLSessionConfiguration class];
         Method m = class_getInstanceMethod(cfg, @selector(protocolClasses));
         if (m) { orig_protocolClasses = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)my_protocolClasses); }
-        GBLog(@"=== GBOffline v4 loaded (scan_key=%d). stubs dir: %@, hosts: %@, routes: %lu ===", (int)gScanEnabled, gStubDir, gHosts, (unsigned long)gRoutes.count);
+        GBLog(@"=== GBOffline v4.2 loaded (scan_key=%d). stubs dir: %@, hosts: %@, routes: %lu ===", (int)gScanEnabled, gStubDir, gHosts, (unsigned long)gRoutes.count);
     }
 }

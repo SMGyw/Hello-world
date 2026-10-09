@@ -31,5 +31,6 @@
       "file": "stubs/auth.json"
     }
   ],
-  "hook_checkversion": true
+  "hook_checkversion": true,
+  "suppress_update_popup": true
 }

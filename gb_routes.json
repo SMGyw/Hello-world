@@ -1,0 +1,34 @@
+{
+  "scan_key": true,
+  "dump_segments": true,
+  "hosts": [
+    "joycity.com",
+    "joycityplay.com",
+    "joycityglobal.com",
+    "61.43.46.177"
+  ],
+  "default": {
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"result\":0,\"ErrorCode\":0}"
+  },
+  "routes": [
+    {
+      "_note": "GUESSED matches - the real URL/command scheme is unconfirmed. Fix from gb_capture.log.",
+      "match": "check_version",
+      "file": "stubs/check_version.json"
+    },
+    {
+      "match": "NetworkCheck",
+      "file": "stubs/network_check.json"
+    },
+    {
+      "match": "server_info",
+      "file": "stubs/server_info.json"
+    },
+    {
+      "match": "auth",
+      "file": "stubs/auth.json"
+    }
+  ]
+}

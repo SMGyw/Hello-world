@@ -47,7 +47,8 @@ static NSString *gLogPath;
 static struct in_addr gDeadIP;               // 61.43.46.177
 static NSLock *gLock;
 static BOOL gScanEnabled = YES;
-static BOOL gDumpEnabled = YES;
+static BOOL gDumpEnabled = NO;
+static BOOL gHookVersion = YES;
 static int gCryptoLogBudget = 600;
 static NSMutableSet *gSeenDNS;
 
@@ -80,6 +81,7 @@ static void GBLoadConfig(void) {
     gLogPath = [docs stringByAppendingPathComponent:@"gb_capture.log"];
     if (cfg[@"scan_key"]) gScanEnabled = [cfg[@"scan_key"] boolValue];
     if (cfg[@"dump_segments"]) gDumpEnabled = [cfg[@"dump_segments"] boolValue];
+    if (cfg[@"hook_checkversion"]) gHookVersion = [cfg[@"hook_checkversion"] boolValue];
     inet_pton(AF_INET, "61.43.46.177", &gDeadIP);
 }
 
@@ -120,7 +122,7 @@ static void *GBScanThread(void *arg) {
     gb_aes_init();
     GBLog(@"[keyscan] scanning writable memory for the AES key (one time, can take a few minutes)...");
     static uint8_t buf[(1 << 20) + 64];
-    vm_address_t addr = 0; size_t total = 0;
+    vm_address_t addr = 0; size_t total = 0, nextLog = 64u << 20;
     for (;;) {
         vm_size_t size = 0; vm_region_basic_info_data_64_t info;
         mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
@@ -131,6 +133,7 @@ static void *GBScanThread(void *arg) {
                 if (vm_read_overwrite(mach_task_self(), addr + o, want, (vm_address_t)buf, &got) != KERN_SUCCESS || got < 16) continue;
                 gb_scan_buffer(buf, got, gScanCT, gScanCTLen, 4, GBScanHit, (void *)(addr + o));
                 total += got;
+                if (total >= nextLog) { GBLog(@"[keyscan] progress: %zu MB scanned", total >> 20); nextLog += 64u << 20; }
             }
         }
         addr += size;
@@ -210,6 +213,39 @@ static void GBDumpSegments(void) {
     }
     [info writeToFile:[docs stringByAppendingPathComponent:@"gb_dump_info.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
     GBLog(@"[dump] %@", info);
+}
+
+
+#pragma mark - Version-check bypass (data patch: swaps one vtable pointer, no code is modified)
+
+static uintptr_t gSlide;
+
+// Replacement for the game's checkVersion reply callback (original code at 0x100afabd0, unslid).
+// The original sets the game state to 6 when the reply is valid and shows the "download the latest
+// version" popup otherwise. This does what the success path does: state = 6.
+static void GBCheckVersionDone(void *req, int err, void *resp) {
+    uintptr_t *slot = (uintptr_t *)(0x100d7b4f8 + gSlide);      // slot holding &gameObjectPtr
+    uintptr_t *var = slot ? (uintptr_t *)*slot : NULL;
+    char *obj = var ? (char *)*var : NULL;                       // the game singleton
+    if (obj) *(int *)(obj + 0x1b000 + 0x5a0) = 6;
+    GBLog(@"[patch] checkVersion callback intercepted (err=%d, obj=%p) -> game state 6", err, obj);
+}
+
+// __S3E_DATA is unpacked by the engine after dyld loads us, so wait until the slot holds the original pointer.
+static void *GBVtableThread(void *arg) {
+    uintptr_t slotAddr = 0x100d68d50 + gSlide, orig = 0x100afabd0 + gSlide;
+    for (int i = 0; i < 2400; i++) {                             // up to ~2 minutes
+        if (*(volatile uintptr_t *)slotAddr == orig) {
+            size_t pg = (size_t)getpagesize();
+            kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)(slotAddr & ~(pg - 1)), pg, FALSE, VM_PROT_READ | VM_PROT_WRITE);
+            *(volatile uintptr_t *)slotAddr = (uintptr_t)&GBCheckVersionDone;
+            GBLog(@"[patch] vtable slot 0x%lx swapped (vm_protect=%d)", (unsigned long)slotAddr, (int)kr);
+            return NULL;
+        }
+        usleep(50000);
+    }
+    GBLog(@"[patch] vtable slot never held the expected callback (0x%lx) - NOT patched", (unsigned long)orig);
+    return NULL;
 }
 
 #pragma mark - Router (shared by both layers)
@@ -404,11 +440,13 @@ __attribute__((constructor)) static void GBInit(void) {
         gLock = [NSLock new]; gSeenDNS = [NSMutableSet set];
         GBLoadConfig();
         [NSURLProtocol registerClass:[GBProto class]];
+        gSlide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+        if (gHookVersion) { pthread_t vt; pthread_create(&vt, NULL, GBVtableThread, NULL); pthread_detach(vt); }
         if (gDumpEnabled)
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ GBDumpSegments(); });
         Class cfg = objc_getClass("__NSCFURLSessionConfiguration") ?: [NSURLSessionConfiguration class];
         Method m = class_getInstanceMethod(cfg, @selector(protocolClasses));
         if (m) { orig_protocolClasses = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)my_protocolClasses); }
-        GBLog(@"=== GBOffline v3 loaded (scan_key=%d). stubs dir: %@, hosts: %@, routes: %lu ===", (int)gScanEnabled, gStubDir, gHosts, (unsigned long)gRoutes.count);
+        GBLog(@"=== GBOffline v4 loaded (scan_key=%d). stubs dir: %@, hosts: %@, routes: %lu ===", (int)gScanEnabled, gStubDir, gHosts, (unsigned long)gRoutes.count);
     }
 }

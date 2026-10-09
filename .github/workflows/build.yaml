@@ -1,0 +1,54 @@
+name: Build GBOffline dylib
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun -sdk iphoneos --show-sdk-path
+
+      - name: Build GBOffline.dylib (arm64, iOS)
+        run: |
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -dynamiclib \
+            -fobjc-arc \
+            -O2 \
+            -Wno-deprecated-declarations \
+            -miphoneos-version-min=12.0 \
+            -framework Foundation \
+            -install_name @rpath/GBOffline.dylib \
+            -o GBOffline.dylib \
+            GBOffline.m
+
+      - name: Ad-hoc sign (re-sign again when you install the IPA)
+        run: codesign -f -s - GBOffline.dylib
+
+      - name: Verify
+        run: |
+          file GBOffline.dylib
+          lipo -info GBOffline.dylib
+          otool -L GBOffline.dylib
+          # the interpose table must be present or the network hooks will not work
+          otool -l GBOffline.dylib | grep -A1 "sectname __interpose" || (echo "missing __interpose section" && exit 1)
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp GBOffline.dylib gb_routes.json dist/
+          cp -R stubs dist/stubs
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GBOffline
+          path: dist/

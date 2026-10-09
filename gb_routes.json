@@ -1,6 +1,6 @@
 {
   "scan_key": true,
-  "dump_segments": true,
+  "dump_segments": false,
   "hosts": [
     "joycity.com",
     "joycityplay.com",
@@ -30,5 +30,6 @@
       "match": "auth",
       "file": "stubs/auth.json"
     }
-  ]
+  ],
+  "hook_checkversion": true
 }

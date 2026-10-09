@@ -44,8 +44,10 @@ jobs:
       - name: Package
         run: |
           mkdir -p dist
-          cp GBOffline.dylib gb_routes.json dist/
-          cp -R stubs dist/stubs
+          cp GBOffline.dylib dist/
+          cp gb_routes.json dist/ 2>/dev/null || echo "no gb_routes.json in repo, skipping"
+          if [ -d stubs ]; then cp -R stubs dist/stubs; else echo "no stubs/ folder in repo, skipping"; fi
+          ls -la dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

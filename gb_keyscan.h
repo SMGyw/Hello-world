@@ -99,6 +99,10 @@ static int gb_hexv(uint8_t c) {
     return -1;
 }
 
+static void gb_swapwords(const uint8_t *in, uint8_t *out, int n) {
+    for (int i = 0; i < n; i += 4) { out[i] = in[i+3]; out[i+1] = in[i+2]; out[i+2] = in[i+1]; out[i+3] = in[i]; }
+}
+
 typedef void (*gb_hit_fn)(const uint8_t *key, int klen, const char *how, const uint8_t *plain, size_t plen, size_t off, void *ud);
 
 // Scans b[0..n) with the given stride. Tests raw 16/32-byte windows and 32/64-char hex-text windows.
@@ -114,6 +118,10 @@ static int gb_scan_buffer(const uint8_t *b, size_t n, const uint8_t *ct, size_t 
             for (int i = 0; i < klen; i++) zeros += (b[off + i] == 0);
             if (zeros > (klen == 16 ? 2 : 3)) continue;
             if (gb_try_key(b + off, klen, ct, ctlen, plain)) { hit(b + off, klen, "raw", plain, plen, off, ud); hits++; }
+            else {   // OpenSSL-style key schedules store each 32-bit word byte-swapped
+                uint8_t sw[32]; gb_swapwords(b + off, sw, klen);
+                if (gb_try_key(sw, klen, ct, ctlen, plain)) { hit(sw, klen, "word-swapped", plain, plen, off, ud); hits++; }
+            }
         }
         for (int hl = 32; hl <= 64; hl += 32) {   // key stored as hex text
             if (off + (size_t)hl > n) break;

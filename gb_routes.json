@@ -1,5 +1,5 @@
 {
-  "scan_key": true,
+  "scan_key": false,
   "dump_segments": false,
   "hosts": [
     "joycity.com",
@@ -32,5 +32,6 @@
     }
   ],
   "hook_checkversion": true,
-  "suppress_update_popup": true
+  "suppress_update_popup": true,
+  "trace_popups": true
 }

@@ -23,6 +23,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <execinfo.h>
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>
 #include <unistd.h>
@@ -50,6 +51,7 @@ static BOOL gScanEnabled = YES;
 static BOOL gDumpEnabled = NO;
 static BOOL gHookVersion = YES;
 static BOOL gSuppressPopup = YES;
+static BOOL gTracePopups = YES;
 static int gCryptoLogBudget = 600;
 static NSMutableSet *gSeenDNS;
 
@@ -84,6 +86,7 @@ static void GBLoadConfig(void) {
     if (cfg[@"dump_segments"]) gDumpEnabled = [cfg[@"dump_segments"] boolValue];
     if (cfg[@"hook_checkversion"]) gHookVersion = [cfg[@"hook_checkversion"] boolValue];
     if (cfg[@"suppress_update_popup"]) gSuppressPopup = [cfg[@"suppress_update_popup"] boolValue];
+    if (cfg[@"trace_popups"]) gTracePopups = [cfg[@"trace_popups"] boolValue];
     inet_pton(AF_INET, "61.43.46.177", &gDeadIP);
 }
 
@@ -222,6 +225,33 @@ static void GBDumpSegments(void) {
 
 static uintptr_t gSlide;
 
+
+// ---- Allocation tracer: the game's popups are ~800-byte (0x320) objects. Every distinct call chain that allocates
+// an object of about that size is recorded (no logging inside malloc) and flushed to the log by the monitor loop.
+typedef struct { void *bt[14]; int n; size_t sz; } gb_arec;
+static gb_arec gArec[512];
+static volatile int gArecN;
+static volatile int gTraceBusy;
+static volatile int gTraceActive;
+static unsigned long gSeenHash[256];
+static volatile int gSeenN;
+static int gArecFlushed;
+static int gAllocLogBudget = 300;
+
+static void GBFlushAllocs(void) {
+    int n = gArecN; if (n > 512) n = 512;
+    while (gArecFlushed < n && gArec[gArecFlushed].n > 0) {
+        gb_arec *r = &gArec[gArecFlushed++];
+        NSMutableString *f = [NSMutableString string];
+        uintptr_t lo = gSlide + 0x100000000ULL, hi = gSlide + 0x100e00000ULL;
+        for (int i = 0; i < r->n; i++) {
+            uintptr_t a = (uintptr_t)r->bt[i];
+            if (a >= lo && a < hi) [f appendFormat:@" %lx", (unsigned long)(a - gSlide)];
+        }
+        if (gAllocLogBudget-- > 0) GBLog(@"[alloc] size=0x%zx return addresses in game code:%@", r->sz, f);
+    }
+}
+
 // Replacement for the game's checkVersion reply callback (original code at 0x100afabd0, unslid).
 // The original sets the game state to 6 when the reply is valid and shows the "download the latest
 // version" popup otherwise. This does what the success path does: state = 6.
@@ -247,6 +277,7 @@ static void *GBVtableThread(void *arg) {
             int last = -999; BOOL flagLogged = NO;
             for (;;) {
                 usleep(50000);
+                GBFlushAllocs();
                 uintptr_t *slot = (uintptr_t *)(0x100d7b4f8 + gSlide);
                 uintptr_t *var = slot ? (uintptr_t *)*slot : NULL;
                 char *obj = var ? (char *)*var : NULL;
@@ -443,9 +474,31 @@ static int my_connect(int fd, const struct sockaddr *a, socklen_t len) {
     return connect(fd, a, len);
 }
 
+
+// malloc hook: records distinct call chains for allocations of popup-object size. No TLS, no logging, no
+// allocation of its own: a global busy flag makes any re-entrant call (e.g. from backtrace) fall straight through.
+static void *my_malloc(size_t sz) {
+    void *p = malloc(sz);
+    if (sz >= 0x320 && sz <= 0x350 && gTraceActive && gArecN < 512 && __sync_bool_compare_and_swap(&gTraceBusy, 0, 1)) {
+        void *bt[14]; int n = backtrace(bt, 14);
+        unsigned long h = 5381; uintptr_t lo = gSlide + 0x100000000ULL, hi = gSlide + 0x100e00000ULL;
+        for (int i = 1; i < n && i < 7; i++) { uintptr_t a = (uintptr_t)bt[i]; if (a >= lo && a < hi) h = h * 33 + (a - gSlide); }
+        int seen = 0, cnt = gSeenN;
+        for (int i = 0; i < cnt && i < 256; i++) if (gSeenHash[i] == h) { seen = 1; break; }
+        if (!seen && cnt < 256) {
+            gSeenHash[cnt] = h; gSeenN = cnt + 1;
+            int k = gArecN;
+            if (k < 512) { memcpy(gArec[k].bt, bt, sizeof(void *) * (size_t)n); gArec[k].sz = sz; gArec[k].n = n; gArecN = k + 1; }
+        }
+        gTraceBusy = 0;
+    }
+    return p;
+}
+
 GB_INTERPOSE(my_getaddrinfo, getaddrinfo)
 GB_INTERPOSE(my_gethostbyname, gethostbyname)
 GB_INTERPOSE(my_connect, connect)
+GB_INTERPOSE(my_malloc, malloc)
 GB_INTERPOSE(my_CCCrypt, CCCrypt)
 GB_INTERPOSE(my_CCCryptorCreateWithMode, CCCryptorCreateWithMode)
 GB_INTERPOSE(my_CCCryptorUpdate, CCCryptorUpdate)
@@ -461,12 +514,13 @@ __attribute__((constructor)) static void GBInit(void) {
         GBLoadConfig();
         [NSURLProtocol registerClass:[GBProto class]];
         gSlide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+        gTraceActive = gTracePopups ? 1 : 0;
         if (gHookVersion) { pthread_t vt; pthread_create(&vt, NULL, GBVtableThread, NULL); pthread_detach(vt); }
         if (gDumpEnabled)
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ GBDumpSegments(); });
         Class cfg = objc_getClass("__NSCFURLSessionConfiguration") ?: [NSURLSessionConfiguration class];
         Method m = class_getInstanceMethod(cfg, @selector(protocolClasses));
         if (m) { orig_protocolClasses = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)my_protocolClasses); }
-        GBLog(@"=== GBOffline v4.2 loaded (scan_key=%d). stubs dir: %@, hosts: %@, routes: %lu ===", (int)gScanEnabled, gStubDir, gHosts, (unsigned long)gRoutes.count);
+        GBLog(@"=== GBOffline v4.3 loaded (scan_key=%d). stubs dir: %@, hosts: %@, routes: %lu ===", (int)gScanEnabled, gStubDir, gHosts, (unsigned long)gRoutes.count);
     }
 }
